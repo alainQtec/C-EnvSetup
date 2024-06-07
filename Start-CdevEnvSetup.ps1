@@ -1,3 +1,4 @@
+using namespace System.IO
 using namespace System.Management.Automation
 enum HostOs {
     Windows
@@ -6,10 +7,56 @@ enum HostOs {
     UNKNOWN
 }
 #region    classes
+class MinRequirements {
+    [int]$FreeMemGB = 1
+    [int]$MinDiskGB = 10
+    [bool]$RunAsAdmin = $false
+    [string[]]$RequiredFiles
+    [string[]]$RequiredDirectories
+    MinRequirements() {}
+
+    [System.Collections.Specialized.OrderedDictionary] Validate() {
+        [string]$OsName = [Setup]::GetHostOs()
+        $freeDiskGB = [math]::Round((Get-PSDrive -Name ([IO.Directory]::GetDirectoryRoot((Get-Location)))).Free / 1GB)
+        $freRAMsize = $(switch ($OsName) {
+                "Windows" {
+                    [math]::Round((Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+                    break
+                }
+                "Linux" {
+                    [math]::Round([int64](((& free -b) -split "`n")[1] -split "\s+")[1] / 1GB, 2)
+                    break;
+                }
+                "MacOs" {
+                    [math]::Round(((& sysctl hw.memsize) -split ' ')[1] / 1GB, 2)
+                    break;
+                }
+                Default { throw "Unable to read memory size for OS: $OsName" }
+            }
+        )
+        return [ordered]@{
+            HasEnoughRAM          = $freRAMsize -ge $this.FreeMemGB
+            HasEnoughDiskSpace    = $freeDiskGB -ge $this.MinDiskGB
+            HasAdminPrivileges    = $this.RunAsAdmin -and [Setup]::IsAdmin()
+            HasAllRequiredFiles   = ($this.RequiredFiles -as [IO.FileInfo[]]).Where({ ![IO.File]::Exists($_.FullName) }).count -eq 0
+            HasAllRequiredFolders = ($this.RequiredDirectories -as [IO.DirectoryInfo[]]).Where({ ![IO.Directory]::Exists($_.FullName) }).count -eq 0
+        }
+    }
+}
 class InstallReport {
-    [string]$Message
-    InstallReport([string]$message) {
-        $this.Message = $message
+    hidden [string]$Title
+    InstallReport ([string]$Title, [hashtable]$table) {
+        $this.Title = $Title; $this.SetObjects($table)
+    }
+    hidden [void] SetObjects([hashtable]$table) {
+        $dict = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $table.Keys.ForEach({ [void]$dict.Add($_, $table[$_]) }); $this.SetObjects($dict)
+    }
+    [void] SetObjects([System.Collections.Generic.Dictionary[string, string]]$dict) {
+        $dict.Keys.ForEach({ $this.psobject.Properties.Add([PSScriptProperty]::new($_, [scriptblock]::Create("return '$($dict[$_])'"), { throw "$_ is a readonly property" })) })
+    }
+    [string] ToString() {
+        return (" " + $this.Title + "`n" + ($this | Format-List | Out-String))
     }
 }
 
@@ -38,11 +85,7 @@ class Setup {
     }
     static [BackgroundTask] Invoke([Setup]$setup, [bool]$AsAdmin) {
         $result = [BackgroundTask]::new()
-        if ($AsAdmin) { if (![Setup]::IsAdmin()) { throw "Please run as an administrator." } }
-        if (![Setup]::CheckRequirements()) {
-            throw "Requirements check failed. Aborting setup."
-        }
-        # Todo: Write code to follow queue in $setup.Steps order, and run each step asynchronously
+        if (!$setup.CheckRequirements()) { throw "Some minimum Install requirements were not met" }
         foreach ($step in $setup.steps) {
             $result.Output.Add($step.Run($true)) | Out-Null
         }
@@ -63,20 +106,37 @@ class Setup {
     }
     static [bool] IsAdmin() {
         # Check if running with administrative privileges
-        [bool]$Isadmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if ($Isadmin) {
-            Write-Host "This script requires administrative privileges. Please run it as an administrator." -ForegroundColor Red
-        }
+        [string]$_Host_OS = [Setup]::getHostOs()
+        [bool]$Isadmin = $(switch ($true) {
+                $($_Host_OS -eq "Windows") {
+                    $(New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);
+                    break;
+                }
+                $($_Host_OS -in ("MacOS", "Linux")) {
+                    $(whoami) -eq "root";
+                    break;
+                }
+                Default {
+                    Write-Warning "Unknown OS: $_Host_OS";
+                    $false
+                }
+            }
+        )
+        if (!$Isadmin) { Write-Warning "[USER is not ADMIN]. This script requires administrative privileges." }
         return $Isadmin
     }
     [void] SetSteps([string[]]$methods) {
         $methods.ForEach({ $this.steps.Enqueue([SetupStep]::New($_, [scriptblock]::Create("return [$($this.GetType().Name)]::$_()"))) })
     }
-    static [InstallReport] GetInstallReport() {
+    [InstallReport] GetInstallReport() {
         return [InstallReport]::new("C/C++ development environment setup completed successfully.")
     }
-    static [bool] CheckRequirements() {
-        return $true
+    [bool] CheckRequirements() {
+        $InstallReqs = [MinRequirements]::new()
+        $CheckResult = $InstallReqs.Validate()
+        $verbose_Msg = "Checking install requirements ...`n{0}" -f (New-Object PsObject -Property $CheckResult | Out-String).TrimEnd()
+        Write-Verbose $verbose_Msg
+        return !$CheckResult.Values.Contains($false)
     }
 }
 
@@ -136,9 +196,11 @@ class BackgroundTask {
 }
 
 class CboxSetup : Setup {
+    [bool]$asAdmin = $true
     [bool]$UseCloudVps = $false
     CboxSetup() {
         $this.SetSteps(@(
+                "CheckRequirements",
                 "InstallChoco",
                 "InstallMSYS2",
                 "InstallGcc",
@@ -152,9 +214,7 @@ class CboxSetup : Setup {
         )
     }
     [BackgroundTask] Invoke() {
-        $asAdmin = $true;
-        if ($this.UseCloudVps) { $asAdmin = $false; }
-        return [CboxSetup]::Invoke($this, $asAdmin)
+        return [CboxSetup]::Invoke($this, ($this.asAdmin -and !$this.UseCloudVps))
     }
     static [void] InstallChoco() {
         # Install Chocolatey package manager
@@ -203,6 +263,17 @@ class CboxSetup : Setup {
     }
     static [void] InstallGit() {
         choco install git -y
+    }
+    static [bool] CheckRequirements() {
+        # Checking if certain software or tools are installed by checking their install file paths:
+        $FilesTocheck = @()
+        $FilesTocheck += [FileInfo]::new("$env:ChocolateyInstall\bin\choco.exe")
+        $FilesTocheck += [FileInfo]::new("$env:ChocolateyInstall\lib\msys2\tools\msys2.exe")
+
+        $DirectoriesTocheck = @()
+        $DirectoriesTocheck += [DirectoryInfo]::new("$env:ChocolateyInstall\bin")
+        $DirectoriesTocheck += [DirectoryInfo]::new("$env:ChocolateyInstall\lib\msys2\tools")
+        return [CboxSetup]::CheckRequirements($FilesTocheck, $DirectoriesTocheck)
     }
 }
 #endregion classes
