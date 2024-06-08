@@ -13,9 +13,10 @@ class MinRequirements {
     [bool]$RunAsAdmin = $false
     [string[]]$RequiredFiles
     [string[]]$RequiredDirectories
+    hidden [string[]]$IgnoredProps = @()
     MinRequirements() {}
 
-    [System.Collections.Specialized.OrderedDictionary] Validate() {
+    [Ordered] Validate() {
         [string]$OsName = [Setup]::GetHostOs()
         $freeDiskGB = [math]::Round((Get-PSDrive -Name ([IO.Directory]::GetDirectoryRoot((Get-Location)))).Free / 1GB)
         $freRAMsize = $(switch ($OsName) {
@@ -34,13 +35,16 @@ class MinRequirements {
                 Default { throw "Unable to read memory size for OS: $OsName" }
             }
         )
-        return [ordered]@{
+        $h = @{
             HasEnoughRAM          = $freRAMsize -ge $this.FreeMemGB
             HasEnoughDiskSpace    = $freeDiskGB -ge $this.MinDiskGB
             HasAdminPrivileges    = $this.RunAsAdmin -and [Setup]::IsAdmin()
             HasAllRequiredFiles   = ($this.RequiredFiles -as [IO.FileInfo[]]).Where({ ![IO.File]::Exists($_.FullName) }).count -eq 0
             HasAllRequiredFolders = ($this.RequiredDirectories -as [IO.DirectoryInfo[]]).Where({ ![IO.Directory]::Exists($_.FullName) }).count -eq 0
         }
+        Write-Verbose -Message $("Checking install requirements ...`n{0}" -f (New-Object PsObject -Property $h | Out-String).TrimEnd())
+        $r = [Ordered]::new(); $h.Keys.Where({ $_ -notin $this.IgnoredProps }).ForEach({ $r.Add($_, $h[$_]) })
+        return $r
     }
 }
 class InstallReport {
@@ -70,24 +74,31 @@ class SetupStep {
         $this.Name = $Name
         $this.Command = $Command
     }
-    [void] Run([bool]$Async) {
-        $this.Command.Invoke()
+    [BackgroundTask] Run([bool]$Async) {
+        if ($Async) {
+            $msg = "[Bug] Asyncronous job for $($this.Name) is not yet implemented"
+            Write-Warning $msg
+            return [BackgroundTask]::new($msg)
+        } else {
+            return [BackgroundTask]::new($(Start-Job -Name $this.Name -ScriptBlock { param([scriptBlock]$Command) return $Command.Invoke() } -ArgumentList $this.Command))
+        }
     }
 }
 
 class Setup {
+    [bool] $RunAsAdmin = $true
     static [HostOs] $HostOs = [Setup]::GetHostOs()
     static [ActionPreference] $OnError = (Get-Variable -Name ErrorActionPreference -ValueOnly)
-    [System.Collections.Generic.Queue[SetupStep]]$steps = @()
+    [System.Collections.Generic.Queue[SetupStep]]$Steps = @()
 
     static [BackgroundTask] Invoke([Setup]$setup) {
         return [Setup]::Invoke($setup, $true)
     }
-    static [BackgroundTask] Invoke([Setup]$setup, [bool]$AsAdmin) {
+    static [BackgroundTask] Invoke([Setup]$setup, [bool]$RunAsAdmin) {
         $result = [BackgroundTask]::new()
         if (!$setup.CheckRequirements()) { throw "Some minimum Install requirements were not met" }
-        foreach ($step in $setup.steps) {
-            $result.Output.Add($step.Run($true)) | Out-Null
+        foreach ($step in $setup.Steps) {
+            [void]$result.Output.Add($step.Run($true))
         }
         return $result
     }
@@ -105,7 +116,6 @@ class Setup {
         )
     }
     static [bool] IsAdmin() {
-        # Check if running with administrative privileges
         [string]$_Host_OS = [Setup]::getHostOs()
         [bool]$Isadmin = $(switch ($true) {
                 $($_Host_OS -eq "Windows") {
@@ -132,11 +142,8 @@ class Setup {
         return [InstallReport]::new("C/C++ development environment setup completed successfully.")
     }
     [bool] CheckRequirements() {
-        $InstallReqs = [MinRequirements]::new()
-        $CheckResult = $InstallReqs.Validate()
-        $verbose_Msg = "Checking install requirements ...`n{0}" -f (New-Object PsObject -Property $CheckResult | Out-String).TrimEnd()
-        Write-Verbose $verbose_Msg
-        return !$CheckResult.Values.Contains($false)
+        $InstallReqs = [MinRequirements]::new(); if (!$this.RunAsAdmin) { $InstallReqs.IgnoredProps += "HasAdminPrivileges" }
+        return !$InstallReqs.Validate().Values.Contains($false)
     }
 }
 
@@ -196,7 +203,6 @@ class BackgroundTask {
 }
 
 class CboxSetup : Setup {
-    [bool]$asAdmin = $true
     [bool]$UseCloudVps = $false
     CboxSetup() {
         $this.SetSteps(@(
@@ -214,7 +220,10 @@ class CboxSetup : Setup {
         )
     }
     [BackgroundTask] Invoke() {
-        return [CboxSetup]::Invoke($this, ($this.asAdmin -and !$this.UseCloudVps))
+        if ($this.UseCloudVps -and $this.RunAsAdmin) {
+            throw [System.InvalidOperationException]::new("Cannot run as admin on a cloud VPS")
+        }
+        return [CboxSetup]::Invoke($this, $this.RunAsAdmin)
     }
     static [void] InstallChoco() {
         # Install Chocolatey package manager
