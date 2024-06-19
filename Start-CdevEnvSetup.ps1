@@ -193,6 +193,110 @@ enum HostOs {
     MacOS
     UNKNOWN
 }
+
+enum NeovimTemplate {
+    AstroNvim  # A well-structured Neovim config: https://astronvim.com
+    Kickstart  # A minimal Neovim config to get started quickly. https://github.com/nvim-lua/kickstart.nvim
+    LunarVim   # An IDE layer for Neovim: https://github.com/LunarVim/LunarVim
+    SpaceVim   # https://spacevim.org/
+    LazyVim    # Neovim config for the lazy: https://github.com/LazyVim/LazyVim
+    NvChad     # Blazing fast Neovim setup: https://github.com/NvChad/NvChad
+    Basic      # Minimal Neovim Config: https://github.com/NvChad/basic-config.nvim
+    Noot       # Modern Neovim Config: https://github.com/shortcuts/noot.nvim
+}
+
+enum CmdType {
+    Script
+    Cmdlet
+    Function
+    Application
+}
+
+class Runner {
+    # Execute commands on host
+    # Supports sync&asynchronous operation
+    static [object[]]$Commands = (Get-Command -Type All)
+    Runner() {}
+
+    [void] Run([string]$Command, [Parameter[]]$Params, [object[]]$Data, [string]$ParameterSetName) {
+        $Threads = @(); [int]$ThreadCount = 10; [int]$Count = 0
+        $Length = $JobsLeft = $Data.Count
+        if ($Length -lt $ThreadCount) { $ThreadCount = $Length }
+        $timer = (1..$ThreadCount).ForEach({ $null })
+        $Jobs = (1..$ThreadCount).ForEach({ $null })
+        $CmdType = [Runner]::GetCommandType($Command)
+        $t = $CmdType.ToString()
+        if ($t -eq 'Cmdlet') {
+            1..$ThreadCount | ForEach-Object { $Threads += [powershell]::Create().AddCommand($Cmdlet) }
+        } else {
+            $ScriptBlock = $(switch ($t) {
+                    'Script' { $Command -as [ScriptBlock]; break }
+                    'Function' { $(Get-Item Function:/$Command).ScriptBlock; break }
+                    'Application' { [scriptblock]::Create("return &$Command"); break }
+                    Default { throw 'Could Not resolve command type' }
+                }
+            )
+            1..$ThreadCount | ForEach-Object { $Threads += [powershell]::Create().AddScript($ScriptBlock) }
+        }
+        if ($Params) { $Threads | ForEach-Object { $_.AddParameters($Params) | Out-Null } }
+        while ($JobsLeft) {
+            for ($idx = 0; $idx -le ($ThreadCount - 1) ; $idx++) {
+                $SetParamObj = $Threads[$idx].Commands.Commands[0].Parameters | Where-Object { $_.Name -eq $ParameterSetName }
+                If ($Jobs[$idx].IsCompleted) {
+                    #job ran ok, clear it out
+                    $result = $null
+                    if ($threads[$idx].InvocationStateInfo.State -eq "Failed") {
+                        $result = $Threads[$idx].InvocationStateInfo.Reason
+                        Write-Error "Set Item: $($SetParamObj.Value) Exception: $result"
+                    } else {
+                        $result = $Threads[$idx].EndInvoke($Jobs[$idx])
+                    }
+                    $ts = New-TimeSpan -Start $timer[$idx] -End ([datetime]::Now)
+                    [PSCustomObject]@{
+                        Output   = $result
+                        TimeSpan = $ts
+                        SetItem  = $SetParamObj.Value
+                    }
+                    $Jobs[$idx] = $null
+                    $JobsLeft--
+                    Write-Verbose "Completed: $($SetParamObj.Value) in $ts"
+                    Write-Progress -Activity "Processing Batch" -Status "$JobsLeft jobs left" -PercentComplete (($length - $jobsleft) / $length * 100) -Id 2 -ParentId 1
+                }
+                if (($Count -lt $Length) -and ($null -eq $Jobs[$idx])) {
+                    # Add job if there is more to process
+                    Write-Verbose "starting: $($Data[$Count])"
+                    $timer[$idx] = Get-Date
+                    $Threads[$idx].Commands.Commands[0].Parameters.Remove($SetParamObj) | Out-Null # Check for success?
+                    $Threads[$idx].AddParameter('Param', $Data[$Count]) | Out-Null
+                    $Jobs[$idx] = $Threads[$idx].BeginInvoke()
+                    $Count++
+                }
+            }
+        }
+        $Threads | ForEach-Object { $_.runspace.close(); $_.Dispose() }
+    }
+    static [CmdType] GetCommandType([string]$Command) {
+        if ($Command.StartsWith('{') -and $Command.EndsWith('}')) { return [CmdType]::Script }
+        $t = [Runner]::_CommandTypes($Command)
+        if ($t -in [enum]::GetNames([CmdType])) {
+            return [CmdType]::"$t";
+        } elseif ($t -in ('ExternalScript', 'Filter', 'Configuration', 'Alias', 'All')) {
+            throw 'Operation Not supported ... (Yet)'
+        } else {
+            throw "Could not resolve commandType"
+        }
+    }
+    static hidden [System.Management.Automation.CommandTypes] _CommandTypes([string]$Command) {
+        $r = [Runner]::Commands.Where({ $_.Name -eq "$Command" })[0]
+        if ($null -eq $r) { throw "Could not resolve CommandTypes" }
+        if ($r.GetType().Name -eq 'AliasInfo') {
+            return [Runner]::Commands.Where({ $_.Name -eq "$($r.ResolvedCommand)" })[0].CommandType
+        } else {
+            return $r.CommandType
+        }
+    }
+}
+
 class MinRequirements {
     [int]$FreeMemGB = 1
     [int]$MinDiskGB = 10
@@ -541,6 +645,24 @@ class CboxSetup : Setup {
         }
         return $?
     }
+    [bool] InstallNeovimConfig([psobject[]]$nptargs) {
+        $_Params = [PSObject]::new() | Select-Object -Property PLugins, TemplateName
+        [psobject]::new() | Select-Object @{l = 'a'; e = { 1222 } }, @{l = ''; e = { 111 } }
+        $_Params.PLugins = [string[]]$nptargs.Where({ $_ -like "*.lua" });
+        $_Params.TemplateName = [NeovimTemplate[]]$nptargs.Where({ $_ -is [NeovimTemplate] -or $_ -is [string] -and $_ -notin $_Params.PLugins });
+        $_Params.TemplateName = $_Params.TemplateName[0]
+        return $this.InstallNeovimConfig($_Params.TemplateName, $_Params.PLugins)
+    }
+    [bool] InstallNeovimConfig([NeovimTemplate]$Template, [string[]]$PLugins) {
+        # $requirements = [PSCustomObject]@{
+        #     Neovim     = https://wiki.archlinux.org/title/Neovim
+        #     Git        = https://git-scm.com/book/en/v2/Getting-Started-Installing-Git
+        #     Nerd_Fonts = https://www.nerdfonts.com/
+        # }
+        "Templates: $Template" | Write-Host -f Yellow
+        $PLugins | Out-String | Write-Host -f Yellow
+        return $?
+    }
     [bool] PrepareVisualStudioCode($nptargs) {
         if (!(Get-Command code -ErrorAction SilentlyContinue)) {
             if ([Setup]::GetHostOs() -eq "Windows") {
@@ -644,28 +766,6 @@ function New-CliArt {
         return [CliArt]::new($Base64String)
     }
 }
-
-# function New-DynamicParam {
-#     param ([string]$Name, [int]$position, [type]$type)
-#     process {
-#         $_params = [System.Management.Automation.RuntimeDefinedParameterDictionary]::New()
-#         $_params.Add($Name, [System.Management.Automation.RuntimeDefinedParameter]::new(
-#                 $Name, $type, @((
-#                         New-Object System.Management.Automation.ParameterAttribute -Property @{
-#                             Position          = $position
-#                             Mandatory         = $false
-#                             ValueFromPipeline = $false
-#                             ParameterSetName  = $PSCmdlet.ParameterSetName
-#                             HelpMessage       = "hlp msg"
-#                         }
-#                     ),
-#                     [System.Management.Automation.ValidateNotNullOrEmptyAttribute]::new()
-#                 )
-#             )
-#         )
-#         return $_params
-#     }
-# }
 
 function Write-AnimatedHost {
     [CmdletBinding()]
@@ -1060,5 +1160,27 @@ function Start-CdevEnvSetup {
         return $outpt
     }
 }
+
+# function New-DynamicParam {
+#     param ([string]$Name, [int]$position, [type]$type)
+#     process {
+#         $_params = [System.Management.Automation.RuntimeDefinedParameterDictionary]::New()
+#         $_params.Add($Name, [System.Management.Automation.RuntimeDefinedParameter]::new(
+#                 $Name, $type, @((
+#                         New-Object System.Management.Automation.ParameterAttribute -Property @{
+#                             Position          = $position
+#                             Mandatory         = $false
+#                             ValueFromPipeline = $false
+#                             ParameterSetName  = $PSCmdlet.ParameterSetName
+#                             HelpMessage       = "hlp msg"
+#                         }
+#                     ),
+#                     [System.Management.Automation.ValidateNotNullOrEmptyAttribute]::new()
+#                 )
+#             )
+#         )
+#         return $_params
+#     }
+# }
 
 # Export-ModuleMember -Function 'Start-CdevEnvSetup' -Variable '*' -Cmdlet '*' -Alias '*' -Verbose:$false
